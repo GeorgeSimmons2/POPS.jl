@@ -31,7 +31,7 @@ With constraints, both steps become quadratic programs:
 
 1. The mean model (`coef`) is the constrained ridge solution
 ```math
-\theta^\star = \underset{\theta}{\operatorname{argmin}}\ \frac12\theta^\top C\theta - b^\top\theta \quad\text{subject to}\quad l \le G\theta \le u.
+\theta^\star = \arg\min_\theta \frac12\theta^\top C\theta - b^\top\theta \quad\text{subject to}\quad l \le G\theta \le u.
 ```
 2. For each retained point ``i``, the POPS minimizer ``\theta_i`` solves the same problem with the additional equality constraint ``x_i^\top\theta = y_i``, and the POPS correction is ``\delta_i = \theta_i - \theta^\star``.
 
