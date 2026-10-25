@@ -1,8 +1,15 @@
+## Tests of the OSQP-based constrained fit (src/fit.jl, `constraint_matrix`/`constraint_bounds` kwargs).
+##
 ## Sanity check: with an empty constraint set, the OSQP-based constrained fit
-## (src/fit.jl, `constraint_matrix`/`constraint_bounds` kwargs) should reproduce
-## the closed-form leverage-based POPS fit, since both are then solving the
+## should reproduce the closed-form leverage-based POPS fit, since both are then solving the
 ## exact same per-point equality-constrained ridge QP. Also plots the two
 ## predictive distributions on top of each other so the agreement is visible.
+##
+## With an equality constraint, the mean and every POPS minimizer must match the exact
+## solution of the corresponding KKT system. With inequality constraints, every POPS
+## minimizer must be feasible and interpolate its training point. Both use dense constraint
+## rows, so that the first-row positions in the CSC storage of the per-point constraint
+## matrix differ from 1:P (an index error there would go unnoticed with no constraints).
 
 using Test
 using LinearAlgebra
@@ -88,6 +95,72 @@ using SparseArrays
 
     rowsize!(fig.layout, 1, Relative(0.65))
 
-    save("test/analytical_vs_osqp.png", fig)
-    @info "saved plot" "analytical_vs_osqp.png"
+    plot_path = joinpath(@__DIR__, "analytical_vs_osqp.png")
+    save(plot_path, fig)
+    @info "saved plot" plot_path
+end
+
+@testset "equality constraint matches KKT solution" begin
+
+    deg = 5
+    P = deg + 1
+    x = range(-1.5, 1.5; length=25)
+    y = @. exp(x) * sin(4x)
+
+    vander(z) = hcat((z .^ k for k in 0:deg)...)
+    X = vander(x)
+
+    # pin the fitted polynomial between two training points: f̂(0.3) = 0.5
+    E = vander([0.3])
+    e = [0.5]
+
+    # tight tolerances, also checks that the solver settings are passed through
+    # (the default correction tolerances only give ~1e-4 agreement here)
+    tight = (eps_abs=1e-9, eps_rel=1e-9)
+    m = fit(POPSModel, X, y; leverage_percentile=0.0,
+        constraint_matrix=E, constraint_bounds=(e, e),
+        mean_solver_settings=tight, correction_solver_settings=tight)
+
+    # exact solution of min ½θᵀCθ - (Xᵀy)ᵀθ  s.t.  Bθ = d
+    C = X' * X
+    kkt(B, d) = ([C B'; B zeros(size(B, 1), size(B, 1))] \ [X' * y; d])[1:P]
+
+    θ = vec(coef(m))
+    @test θ ≈ kkt(E, e) atol = 1e-7
+    for i in 1:size(X, 1)
+        @test θ .+ m.pops_corrections[i, :, 1] ≈ kkt([X[i:i, :]; E], [y[i]; e]) atol = 1e-7
+    end
+end
+
+@testset "inequality constraints hold for every POPS minimizer" begin
+
+    deg = 5
+    P = deg + 1
+    x = range(-1.5, 1.5; length=25)
+    y = @. exp(x) * sin(4x)
+
+    vander(z) = hcat((z .^ k for k in 0:deg)...)
+    X = vander(x)
+
+    # bound the extrapolation just outside the data, |f̂(±1.8)| ≤ c, with c half the
+    # unconstrained excursion so that the bound is active (passed as a sparse matrix)
+    G = vander([-1.8, 1.8])
+    c = 0.5 * maximum(abs.(G * vec(coef(fit(POPSModel, X, y)))))
+    l, u = fill(-c, 2), fill(c, 2)
+
+    m = fit(POPSModel, X, y; leverage_percentile=0.0,
+        constraint_matrix=sparse(G), constraint_bounds=(l, u))
+
+    # OSQP residual tolerance eps_abs + eps_rel * ‖Ax‖∞ with the default settings
+    tol_mean = 1e-4
+    tol = 3e-3
+
+    θ = vec(coef(m))
+    @test all(l .- tol_mean .<= G * θ .<= u .+ tol_mean)
+    @test maximum(abs.(G * θ)) ≈ c atol = tol_mean   # the bound is active
+    for i in 1:size(X, 1)
+        θ_i = θ .+ m.pops_corrections[i, :, 1]
+        @test all(l .- tol .<= G * θ_i .<= u .+ tol)
+        @test X[i, :]' * θ_i ≈ y[i] atol = tol
+    end
 end

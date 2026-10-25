@@ -3,12 +3,21 @@ _resolve_prior(alpha::Real, P::Int, ::Type{T}) where {T} = Matrix{T}(T(alpha) * 
 _resolve_prior(d::AbstractVector, P::Int, ::Type{T}) where {T} = diagm(T.(d))
 _resolve_prior(Sigma::AbstractMatrix, ::Int, ::Type{T}) where {T} = Matrix{T}(Sigma)
 
+# Default OSQP settings for the constrained fit, overridden by `mean_solver_settings` / `correction_solver_settings`
+const _MEAN_SOLVER_DEFAULTS = (max_iter=500_000, check_termination=10, eps_abs=5e-6, eps_rel=5e-6, verbose=false)
+const _CORRECTION_SOLVER_DEFAULTS = (max_iter=500_000, check_termination=10, eps_abs=5e-4, eps_rel=5e-4, verbose=false)
+
+_is_infeasible(status::Symbol) = status in (:Primal_infeasible, :Primal_infeasible_inaccurate)
+
 
 """
     StatsAPI.fit(::Type{POPSModel}, X, y; prior_covariance=nothing,
-                leverage_percentile=0.5, rank_threshold=nothing)
+                leverage_percentile=0.5, rank_threshold=nothing, fit_intercept=false,
+                weights=nothing, verbose=false,
+                constraint_matrix=nothing, constraint_bounds=nothing,
+                mean_solver_settings=(;), correction_solver_settings=(;))
 
-Fit a POPS hypercube regression model.
+Fit a POPS hypercube regression model, optionally subject to linear constraints on the coefficients.
 
 # Arguments
 - `X::AbstractMatrix`: feature matrix, `N × P`
@@ -24,6 +33,25 @@ contribute to the hypercube fit (default `0.5`).
 Default `eps(T) * max(M, P·D)`, where M is the number of samples used for fitting
 - `fit_intercept` : whether to add a constant colums to the feature matrix (default false)
 - `weights`: optional length-`N` vector of non-negative sample weights. Default to `nothing` (unit weights).
+- `verbose`: warn when the effective rank exceeds the output dimension (default `false`). OSQP output is
+controlled separately, through the `verbose` field of the solver settings below.
+
+# Linear constraints
+- `constraint_matrix`: optional `K × P` matrix `G` (dense or sparse) of linear constraints on the coefficients `θ`.
+Its columns follow those of `X`, preceded by the intercept column if `fit_intercept=true` (`G` then has `P + 1` columns).
+Only univariate `y` is supported.
+- `constraint_bounds`: tuple `(l, u)` of length-`K` vectors imposing `l ≤ G θ ≤ u`, required with `constraint_matrix`.
+Use `l[k] == u[k]` for an equality and `±Inf` for a one-sided constraint.
+- `mean_solver_settings`: `NamedTuple` of [OSQP settings](https://osqp.org/docs/interfaces/solver_settings.html)
+for the constrained mean problem, merged over the defaults
+`(max_iter=500_000, check_termination=10, eps_abs=5e-6, eps_rel=5e-6, verbose=false)`.
+- `correction_solver_settings`: same, for the per-point correction problems, merged over the defaults
+`(max_iter=500_000, check_termination=10, eps_abs=5e-4, eps_rel=5e-4, verbose=false)`.
+
+With constraints, the mean model `coef` is the constrained ridge solution, and the POPS correction of each retained
+point is the solution of the same problem with the additional equality of exactly interpolating that point, taken
+relative to `coef`. Both are quadratic programs solved with OSQP; without constraints, they reduce to the closed-form
+fit. See the *Constrained fitting* page of the documentation.
 """
 function StatsAPI.fit(::Type{POPSModel}, X::AbstractMatrix, y::AbstractVecOrMat;
     prior_covariance=nothing,
@@ -33,7 +61,9 @@ function StatsAPI.fit(::Type{POPSModel}, X::AbstractMatrix, y::AbstractVecOrMat;
     weights=nothing,
     verbose=false,
     constraint_matrix=nothing,
-    constraint_bounds=nothing)
+    constraint_bounds=nothing,
+    mean_solver_settings=(;),
+    correction_solver_settings=(;))
 
     @assert size(X, 1) == size(y, 1) "Number of rows in X and y must match"
 
@@ -83,38 +113,57 @@ function StatsAPI.fit(::Type{POPSModel}, X::AbstractMatrix, y::AbstractVecOrMat;
     h_m = @view h[mask]                          # M
 
 
-    if (constraint_matrix !== nothing)
+    if !isnothing(constraint_matrix)
         @assert D == 1 "constrained POPS fitting only supports univariate y (D = 1)"
-        b = -vec(X_' * Wy_)
+        @assert !isnothing(constraint_bounds) "constraint_bounds = (l, u) must be given with constraint_matrix"
+        @assert size(constraint_matrix, 2) == P "constraint_matrix must have P columns (P + 1 if fit_intercept=true)"
+
+        # OSQP.jl only accepts CSC matrices and Float64 vectors, and only reads the upper triangle of P
+        G = sparse(Float64.(constraint_matrix))
+        l_c = Vector{Float64}(constraint_bounds[1])
+        u_c = Vector{Float64}(constraint_bounds[2])
+        @assert length(l_c) == length(u_c) == size(G, 1) "constraint_bounds must have one entry per row of constraint_matrix"
+        P_qp = sparse(triu(Matrix{Float64}(C_mat)))
+        q_qp = Vector{Float64}(-vec(X_' * Wy_))
 
         # constrained mean model: global constrained ridge solution (no per-point equality)
         mean_qp = OSQP.Model()
-        OSQP.setup!(mean_qp; P=sparse(C_mat), q=b, A=sparse(constraint_matrix),
-                    l=constraint_bounds[1], u=constraint_bounds[2],
-                    max_iter=500_000, check_termination=10, verbose=verbose, eps_abs=5e-6, eps_rel=5e-6)
+        OSQP.setup!(mean_qp; P=P_qp, q=q_qp, A=G, l=l_c, u=u_c,
+                    merge(_MEAN_SOLVER_DEFAULTS, mean_solver_settings)...)
         mean_results = OSQP.solve!(mean_qp)
-        w_final = reshape(mean_results.x, P, D)
+        status = mean_results.info.status
+        _is_infeasible(status) && error("constraints are infeasible (OSQP status $status)")
+        status == :Solved || @warn "OSQP did not converge on the constrained mean model (status $status)"
+        w_final = reshape(FT.(mean_results.x), P, D)
 
         # per-point POPS corrections: each solves the same constraints plus an
         # equality forcing exact interpolation of that point; correction is
         # measured relative to the constrained mean model above.
-        model = OSQP.Model()
+        # Only the first row of A and its bounds change between points, so the solver is set up once,
+        # with a dense placeholder first row fixing the sparsity pattern, and updated in place
+        # (which also warm-starts each solve from the previous solution).
+        A_qp = [sparse(ones(1, P)); G]
+        Ax_idx = A_qp.colptr[1:P]          # positions of A_qp[1, :] in A_qp.nzval
+        l_qp = [0.0; l_c]
+        u_qp = [0.0; u_c]
+
+        corr_qp = OSQP.Model()
+        OSQP.setup!(corr_qp; P=P_qp, q=q_qp, A=A_qp, l=l_qp, u=u_qp,
+                    merge(_CORRECTION_SOLVER_DEFAULTS, correction_solver_settings)...)
+
         T_corr_mat = zeros(FT, M, P)
-        j = 0
-        for (idx, mask_bool) in enumerate(mask)
-            mask_bool || continue
-            j += 1
-            A_full = vcat(WX_[idx, :]', constraint_matrix)
-            l_full = vcat([Wy_[idx, 1]], constraint_bounds[1])
-            u_full = vcat([Wy_[idx, 1]], constraint_bounds[2])
-            A_sparse = sparse(A_full)
+        n_unsolved = 0
+        for (j, i) in enumerate(findall(mask))
+            l_qp[1] = u_qp[1] = y_[i, 1]
+            OSQP.update!(corr_qp; l=l_qp, u=u_qp, Ax=Vector{Float64}(X_[i, :]), Ax_idx=Ax_idx)
 
-            OSQP.setup!(model; P=sparse(C_mat), q=b, A=A_sparse, l=l_full, u=u_full,
-                        max_iter=500_000, check_termination=10, verbose=verbose, eps_abs=5e-4, eps_rel=5e-4)
-
-            results = OSQP.solve!(model)
+            results = OSQP.solve!(corr_qp)
+            status = results.info.status
+            _is_infeasible(status) && error("constraints are infeasible when interpolating training point $i (OSQP status $status)")
+            n_unsolved += status != :Solved
             T_corr_mat[j, :] = results.x .- vec(w_final)
         end
+        n_unsolved > 0 && @warn "OSQP did not converge on $n_unsolved of $M POPS correction problems"
         T_corr = reshape(T_corr_mat, M, P, D)
 
     else
